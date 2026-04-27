@@ -1,0 +1,582 @@
+---
+title: 'Arterial Stiffness and Cognitive Decline: Interactive Visualizations'
+author: "Yuyao Zhang"
+date: "`r Sys.Date()`"
+output: html_document
+runtime: shiny
+resource_files:
+- ehbs_20101014.sas7bdat
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+```{r load-packages}
+library(haven)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(survival)
+library(broom)
+library(tidyr)
+library(shiny)
+```
+
+```{r load-and-prepare-data}
+# Load raw data
+df <- read_sas("ehbs_20101014.sas7bdat")
+
+# Recode variables
+df <- df %>%
+  mutate(
+    sex       = factor(sex,       levels = c(0, 1),    labels = c("Female", "Male")),
+    diabetes  = factor(diabetes_baseline, levels = c(0, 1), labels = c("No", "Yes")),
+    race      = factor(race,      levels = c(0, 1, 2), labels = c("White", "Black", "Other")),
+    education = factor(education, levels = c(0, 1, 2),
+                       labels = c("Less than college", "College degree", "More than college"))
+  ) %>%
+  filter(moca_baseline <= 30 | is.na(moca_baseline))
+
+# Build survival dataset
+df_long <- df %>%
+  select(ehbs_id, sygmacor_pulse_wave, age_baseline, sex, race, education,
+         bmi, sygmacor_systolic, sygmacor_diastolic, diabetes,
+         moca_baseline, moca_yr3, moca_yr5, moca_yr7, moca_yr9,
+         time_yr3, time_yr5, time_yr7, time_yr9) %>%
+  pivot_longer(
+    cols         = c(moca_baseline, moca_yr3, moca_yr5, moca_yr7, moca_yr9),
+    names_to     = "visit",
+    values_to    = "moca_score",
+    names_prefix = "moca_"
+  ) %>%
+  mutate(
+    time_days  = case_when(
+      visit == "baseline" ~ 0,
+      visit == "yr3"      ~ time_yr3,
+      visit == "yr5"      ~ time_yr5,
+      visit == "yr7"      ~ time_yr7,
+      visit == "yr9"      ~ time_yr9
+    ),
+    time_years = time_days / 365.25
+  ) %>%
+  filter(!is.na(moca_score) & moca_score <= 30)
+
+surv_data_full <- df_long %>%
+  group_by(ehbs_id) %>%
+  filter(
+    any(visit == "baseline" & !is.na(moca_score) & moca_score >= 26),
+    any(visit != "baseline")
+  ) %>%
+  arrange(ehbs_id, time_days) %>%
+  summarise(
+    event               = any(moca_score < 26 & visit != "baseline", na.rm = TRUE),
+    time_to_event_days  = if_else(
+      any(moca_score < 26 & visit != "baseline", na.rm = TRUE),
+      min(time_days[moca_score < 26 & visit != "baseline"], na.rm = TRUE) - first(time_days[visit == "baseline"]),
+      max(time_days, na.rm = TRUE) - first(time_days[visit == "baseline"])
+    ),
+    time_to_event_years = time_to_event_days / 365.25,
+    age_baseline        = first(age_baseline),
+    sex                 = first(sex),
+    race                = first(race),
+    education           = first(education),
+    bmi                 = first(bmi),
+    sygmacor_pulse_wave = first(sygmacor_pulse_wave),
+    sygmacor_systolic   = first(sygmacor_systolic),
+    sygmacor_diastolic  = first(sygmacor_diastolic),
+    diabetes            = first(diabetes),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pwv_quartile = ntile(sygmacor_pulse_wave, 4),
+    pwv_group    = factor(pwv_quartile, levels = 1:4,
+                          labels = c("Q1 – Lowest", "Q2 – Low",
+                                     "Q3 – High",   "Q4 – Highest"))
+  )
+
+# Shared color palette
+pwv_colors <- c(
+  "Q1 – Lowest"  = "#2166AC",
+  "Q2 – Low"     = "#74ADD1",
+  "Q3 – High"    = "#F4A582",
+  "Q4 – Highest" = "#D6604D"
+)
+
+# At-risk table helper
+# Returns number at risk at each time break for each PWV group
+get_at_risk <- function(surv_data, time_breaks = c(0, 2, 4, 6, 8)) {
+  groups <- levels(surv_data$pwv_group)
+  result <- lapply(groups, function(g) {
+    d <- surv_data %>% filter(pwv_group == g)
+    n_at_risk <- sapply(time_breaks, function(t) {
+      sum(d$time_to_event_years >= t, na.rm = TRUE)
+    })
+    data.frame(
+      Group     = g,
+      t(n_at_risk),
+      check.names = FALSE
+    )
+  })
+  tbl <- do.call(rbind, result)
+  colnames(tbl) <- c("Group", paste0("t=", time_breaks))
+  tbl
+}
+```
+
+---
+
+```{r dashboard}
+shinyApp(
+  ui = fluidPage(
+
+    # Global CSS
+    tags$head(tags$style(HTML("
+      body { font-family: Arial, sans-serif; background: #f4f6f9; }
+
+      .dashboard-header {
+        background: linear-gradient(135deg, #1F3864 0%, #2E75B6 100%);
+        color: white;
+        padding: 18px 28px 14px 28px;
+        margin-bottom: 18px;
+        border-radius: 6px;
+      }
+      .dashboard-header h2 { margin: 0 0 4px 0; font-size: 22px; }
+      .dashboard-header p  { margin: 0; font-size: 13px; opacity: 0.85; }
+
+      .sidebar-panel {
+        background: #ffffff;
+        border: 1px solid #dde3ec;
+        border-radius: 6px;
+        padding: 16px;
+      }
+      .sidebar-panel h4 {
+        color: #2E75B6;
+        margin-top: 0;
+        font-size: 14px;
+        border-bottom: 1px solid #dde3ec;
+        padding-bottom: 8px;
+      }
+
+      .plot-card {
+        background: white;
+        border: 1px solid #dde3ec;
+        border-radius: 6px;
+        padding: 16px;
+        margin-bottom: 14px;
+      }
+      .plot-card h4 {
+        color: #1F3864;
+        font-size: 15px;
+        margin-top: 0;
+        margin-bottom: 4px;
+      }
+      .plot-card .subtitle {
+        color: #777;
+        font-size: 12px;
+        margin-bottom: 12px;
+      }
+
+      .takeaway-box {
+        background: #EBF3FB;
+        border-left: 4px solid #2E75B6;
+        padding: 10px 14px;
+        border-radius: 0 4px 4px 0;
+        font-size: 12.5px;
+        color: #333;
+        margin-top: 10px;
+      }
+
+      /* At-risk table */
+      .risk-table-wrap {
+        margin-top: 6px;
+        overflow-x: auto;
+      }
+      .risk-table {
+        width: 100%;
+        font-size: 12px;
+        border-collapse: collapse;
+        font-family: monospace;
+      }
+      .risk-table th {
+        background: #f0f4f8;
+        padding: 5px 10px;
+        text-align: center;
+        border: 1px solid #dde3ec;
+        font-weight: bold;
+        color: #444;
+      }
+      .risk-table td {
+        padding: 4px 10px;
+        text-align: center;
+        border: 1px solid #dde3ec;
+      }
+      .risk-table td:first-child {
+        text-align: left;
+        font-weight: bold;
+        white-space: nowrap;
+      }
+
+      .stat-badge {
+        display: inline-block;
+        background: #EBF3FB;
+        border: 1px solid #b3d1ee;
+        border-radius: 4px;
+        padding: 4px 10px;
+        font-size: 13px;
+        color: #1F3864;
+        font-weight: bold;
+        margin-top: 6px;
+      }
+
+      .tab-content { padding-top: 10px; }
+
+      /* Mobile responsiveness */
+      @media (max-width: 768px) {
+        .col-sm-3, .col-sm-9 {
+          width: 100% !important;
+          float: none !important;
+        }
+        .dashboard-header h2 { font-size: 17px; }
+        .plot-card { padding: 10px; }
+        .stat-badge { font-size: 12px; }
+      }
+    "))),
+
+    # Header
+    div(class = "dashboard-header",
+      tags$h2("Arterial Stiffness and Cognitive Decline"),
+      tags$p("Explore how baseline pulse wave velocity (PWV) relates to cognitive
+              performance and time to cognitive impairment. Filter by demographic
+              subgroup to examine consistency of associations.")
+    ),
+
+    # Main layout: sidebar + tabbed plots
+    fluidRow(
+
+      # Sidebar (shared filters)
+      column(3,
+        div(class = "sidebar-panel",
+          h4("Filter Participants"),
+
+          checkboxGroupInput("sex_filter", "Sex:",
+                             choices  = c("Female", "Male"),
+                             selected = c("Female", "Male")),
+
+          checkboxGroupInput("race_filter", "Race / Ethnicity:",
+                             choices  = c("White", "Black", "Other"),
+                             selected = c("White", "Black", "Other")),
+
+          checkboxGroupInput("edu_filter", "Education:",
+                             choices  = c("Less than college",
+                                          "College degree",
+                                          "More than college"),
+                             selected = c("Less than college",
+                                          "College degree",
+                                          "More than college")),
+          hr(),
+          uiOutput("n_badge"),
+          uiOutput("pval_badge")
+        )
+      ),
+
+      # Tabbed plots
+      column(9,
+        tabsetPanel(
+          type = "tabs",
+
+          # Tab 1: Scatter
+          tabPanel("Baseline Association",
+            div(class = "plot-card",
+              h4("Baseline Pulse Wave Velocity vs. Cognitive Performance"),
+              div(class = "subtitle",
+                  "Cross-sectional relationship at study enrollment"),
+              plotlyOutput("scatter_plot", height = "400px"),
+              div(class = "takeaway-box",
+                tags$b("Key Takeaway: "),
+                "Higher baseline PWV is associated with lower MoCA scores,
+                 as shown by the downward-sloping trend line. Color indicates
+                 PWV quartile. Participants in Q4 (red-orange) tend to cluster
+                 at lower cognitive scores compared to Q1 (blue). This pattern
+                 persists across demographic subgroups."
+              )
+            )
+          ),
+
+          # Tab 2: KM curve
+          tabPanel("Survival Analysis",
+            div(class = "plot-card",
+              h4("Time to Cognitive Impairment by PWV Quartile"),
+              div(class = "subtitle",
+                  "Kaplan-Meier curves: probability of remaining cognitively impairment-free"),
+              plotlyOutput("km_plot", height = "380px"),
+              div(class = "risk-table-wrap",
+                tags$p(tags$b("Number at risk"),
+                       style = "font-size:12px; color:#444; margin:10px 0 4px 0;"),
+                tableOutput("risk_table")
+              ),
+              div(class = "takeaway-box",
+                tags$b("Key Takeaway: "),
+                "Participants with the highest PWV (Q4) experienced cognitive
+                 impairment significantly earlier than those with the lowest PWV (Q1).
+                 The number-at-risk table below the curves shows how many participants
+                 in each quartile remained event-free at each follow-up time point.
+                 The log-rank p-value (sidebar) updates as filters are applied."
+              )
+            )
+          ),
+
+          # Tab 3: About the Data
+          tabPanel("About the Data",
+            div(style = "padding: 20px; max-width: 800px;",
+              h4(style = "color:#1F3864; margin-bottom:16px;",
+                 "Dataset Description"),
+              p(style = "font-size:14px; line-height:1.8; color:#333;",
+                "This dashboard uses data from the Emory Healthy Brain Study (EHBS),
+                 a prospective community-based cohort study nested within the Emory Healthy
+                 Aging Study (EHAS), enrolling adults aged 50–75 years who were cognitively
+                 normal at baseline, across the United States. The dataset is confidential
+                 and not publicly available. Data were collected through in-person biennial
+                 assessments including cardiovascular measures (pulse wave velocity),
+                 neuropsychological testing (MoCA), neuroimaging, and biospecimen collection.
+                 A total of 1,822 participants were enrolled in the overall study; the analytic
+                 sample for this dashboard includes participants with available baseline PWV and
+                 MoCA scores, with those having cognitive impairment at baseline (MoCA < 26)
+                 excluded from survival analyses to assess incident cognitive impairment."
+              ),
+              hr(),
+              div(style = "background:#EBF3FB; border-left:4px solid #2E75B6;
+                           padding:10px 14px; border-radius:0 4px 4px 0;
+                           font-size:13px; color:#333; margin-top:10px;",
+                tags$b("Real-World Impact: "),
+                "Arterial stiffness, measured by pulse wave velocity, is a modifiable
+                 cardiovascular risk factor that may serve as an early marker for cognitive
+                 decline before clinical symptoms appear. Identifying this association can
+                 inform preventive strategies targeting vascular health to reduce the burden
+                 of dementia."
+              )
+            )
+          )
+
+        )   # end tabsetPanel
+      )     # end column(9)
+    )       # end fluidRow (main layout)
+  ),        # end fluidPage / end ui
+
+  # Server
+  server = function(input, output, session) {
+
+    # Reactive: filtered scatter data
+    scatter_data <- reactive({
+      df %>%
+        filter(
+          !is.na(sygmacor_pulse_wave),
+          !is.na(moca_baseline),
+          sex       %in% input$sex_filter,
+          race      %in% input$race_filter,
+          education %in% input$edu_filter
+        ) %>%
+        mutate(
+          pwv_quartile = ntile(sygmacor_pulse_wave, 4),
+          pwv_group    = factor(pwv_quartile, levels = 1:4,
+                                labels = c("Q1 – Lowest", "Q2 – Low",
+                                           "Q3 – High",   "Q4 – Highest"))
+        )
+    })
+
+    # Reactive: filtered survival data
+    surv_filtered <- reactive({
+      surv_data_full %>%
+        filter(
+          sex       %in% input$sex_filter,
+          race      %in% input$race_filter,
+          education %in% input$edu_filter
+        ) %>%
+        mutate(
+          pwv_quartile = ntile(sygmacor_pulse_wave, 4),
+          pwv_group    = factor(pwv_quartile, levels = 1:4,
+                                labels = c("Q1 – Lowest", "Q2 – Low",
+                                           "Q3 – High",   "Q4 – Highest"))
+        )
+    })
+
+    # Sidebar badges
+    output$n_badge <- renderUI({
+      div(class = "stat-badge", paste0("n = ", nrow(surv_filtered()), " participants"))
+    })
+
+    output$pval_badge <- renderUI({
+      d <- surv_filtered()
+      req(nrow(d) > 20)
+      lr  <- survdiff(Surv(time_to_event_years, event) ~ pwv_group, data = d)
+      p   <- 1 - pchisq(lr$chisq, df = length(lr$n) - 1)
+      lbl <- if (p < 0.001) "< 0.001" else as.character(round(p, 3))
+      div(class = "stat-badge",
+          style = "margin-top:6px;",
+          paste0("Log-rank p ", lbl))
+    })
+
+    # Widget 1: Scatter plot
+    output$scatter_plot <- renderPlotly({
+      d <- scatter_data()
+      validate(need(nrow(d) > 10, "Please select at least one option per filter."))
+
+      # Group-level summary for tooltip
+      group_summary <- d %>%
+        group_by(pwv_group) %>%
+        summarise(
+          n            = n(),
+          median_pwv   = round(median(sygmacor_pulse_wave, na.rm = TRUE), 1),
+          median_moca  = round(median(moca_baseline, na.rm = TRUE), 1),
+          .groups = "drop"
+        ) %>%
+        mutate(tooltip = paste0(
+          "<b>", pwv_group, "</b><br>",
+          "N: ", n, "<br>",
+          "Median PWV: ", median_pwv, " m/s<br>",
+          "Median MoCA: ", median_moca
+        ))
+
+      d <- d %>% left_join(group_summary %>% select(pwv_group, tooltip),
+                           by = "pwv_group")
+
+      p <- ggplot(d, aes(x = sygmacor_pulse_wave, y = moca_baseline,
+                         color = pwv_group, text = tooltip)) +
+        geom_jitter(alpha = 0.45, size = 1.6, width = 0.15, height = 0.15) +
+        geom_smooth(aes(group = 1), method = "lm", se = TRUE,
+                    color = "black", linewidth = 0.9, linetype = "dashed",
+                    fill = "grey75", alpha = 0.2) +
+        scale_color_manual(values = pwv_colors, name = "PWV Quartile") +
+        scale_x_continuous(breaks = seq(2, 18, by = 2)) +
+        scale_y_continuous(breaks = seq(18, 30, by = 2)) +
+        labs(
+          x = "Baseline Pulse Wave Velocity (m/s)",
+          y = "Baseline MoCA Score (0–30)"
+        ) +
+        theme_minimal(base_size = 13) +
+        theme(panel.grid.minor = element_blank())
+
+      ggplotly(p, tooltip = "text") %>%
+        layout(legend = list(title = list(text = "<b>PWV Quartile</b>")),
+               hoverlabel = list(bgcolor = "white", font = list(size = 12))) %>%
+        config(displayModeBar = TRUE,
+               modeBarButtonsToRemove = c("lasso2d", "select2d",
+                                           "hoverClosestCartesian",
+                                           "hoverCompareCartesian"))
+    })
+
+    # Widget 2: KM plot
+    output$km_plot <- renderPlotly({
+      d <- surv_filtered()
+      validate(need(nrow(d) > 20, "Please select at least one option per filter."))
+
+      km_fit <- survfit(Surv(time_to_event_years, event) ~ pwv_group, data = d)
+      km_df  <- tidy(km_fit) %>%
+        mutate(
+          strata = gsub("pwv_group=", "", strata),
+          strata = factor(strata, levels = c("Q1 – Lowest", "Q2 – Low",
+                                              "Q3 – High",   "Q4 – Highest"))
+        )
+
+      fig <- plot_ly()
+
+      for (grp in levels(km_df$strata)) {
+        g   <- km_df %>% filter(strata == grp)
+        col <- pwv_colors[grp]
+
+        fig <- fig %>%
+          add_ribbons(
+            data       = g,
+            x          = ~time,
+            ymin       = ~conf.low,
+            ymax       = ~conf.high,
+            fillcolor  = adjustcolor(col, alpha.f = 0.13),
+            line       = list(color = "transparent"),
+            showlegend = FALSE,
+            hoverinfo  = "skip",
+            name       = paste0(grp, "_ci")
+          ) %>%
+          add_lines(
+            data      = g,
+            x         = ~time,
+            y         = ~estimate,
+            name      = grp,
+            line      = list(color = col, width = 2.5, shape = "hv"),
+            text      = ~paste0("<b>", strata, "</b><br>",
+                                "Time: ", round(time, 1), " years<br>",
+                                "P(CI-free): ", round(estimate, 3)),
+            hoverinfo = "text"
+          )
+      }
+
+      fig %>%
+        layout(
+          xaxis = list(title     = "Time (years)",
+                       range     = c(0, 9), dtick = 2,
+                       tickfont  = list(size = 12),
+                       titlefont = list(size = 13)),
+          yaxis = list(title     = "Probability of Remaining Cognitively Impairment-Free",
+                       range     = c(0, 1.05), dtick = 0.25,
+                       tickfont  = list(size = 12),
+                       titlefont = list(size = 13)),
+          legend    = list(title = list(text = "<b>PWV Quartile</b>"),
+                           font  = list(size = 12)),
+          hovermode = "x unified",
+          margin    = list(b = 40)
+        ) %>%
+        config(displayModeBar = TRUE,
+               modeBarButtonsToRemove = c("lasso2d", "select2d"))
+    })
+
+    # At-risk table (updates with filters)
+    output$risk_table <- renderTable({
+      d <- surv_filtered()
+      req(nrow(d) > 20)
+
+      time_breaks <- c(0, 2, 4, 6, 8)
+      groups      <- levels(d$pwv_group)
+
+      tbl <- lapply(groups, function(g) {
+        grp_d     <- d %>% filter(pwv_group == g)
+        n_at_risk <- sapply(time_breaks, function(t) {
+          sum(grp_d$time_to_event_years >= t, na.rm = TRUE)
+        })
+        as.data.frame(t(c(n_at_risk)), col.names = paste0("Year ", time_breaks))
+      })
+
+      result           <- do.call(rbind, tbl)
+      colnames(result) <- paste0("Year ", time_breaks)
+      result           <- cbind("PWV Quartile" = groups, result)
+      result
+    },
+    striped   = TRUE,
+    bordered  = TRUE,
+    hover     = TRUE,
+    width     = "100%",
+    spacing   = "s"
+    )
+  },
+
+  options = list(height = 780)
+)
+
+# Real-world impact footer
+fluidRow(
+  column(12,
+    div(style = "margin-top:18px; padding:12px 20px;
+                 background:#1F3864; border-radius:6px;
+                 color:white; font-size:13px; text-align:center;",
+      tags$b("Why This Matters: "),
+      "Arterial stiffness is a modifiable cardiovascular risk factor that may
+       serve as an early marker for cognitive decline before clinical symptoms appear.
+       Identifying this association can inform preventive strategies targeting
+       vascular health to reduce the burden of dementia.",
+      tags$span(style = "margin-left:16px;"),
+      tags$a(href = "https://github.com/你的用户名/你的repo名",
+             target = "_blank",
+             style = "color:#BDD7EE;",
+             "View Source Code on GitHub")
+    )
+  )
+)
+```
